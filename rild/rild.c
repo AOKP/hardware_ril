@@ -1,6 +1,9 @@
 /* //device/system/rild/rild.c
 **
 ** Copyright 2006, The Android Open Source Project
+** Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
+**
+** Not a Contribution
 **
 ** Licensed under the Apache License, Version 2.0 (the "License");
 ** you may not use this file except in compliance with the License.
@@ -29,7 +32,7 @@
 #include <utils/Log.h>
 #include <cutils/properties.h>
 #include <cutils/sockets.h>
-#include <linux/capability.h>
+#include <sys/capability.h>
 #include <linux/prctl.h>
 
 #include <private/android_filesystem_config.h>
@@ -55,6 +58,8 @@ extern void RIL_onUnsolicitedResponse(int unsolResponse, const void *data,
 
 extern void RIL_requestTimedCallback (RIL_TimedCallback callback,
                                void *param, const struct timeval *relativeTime);
+
+extern void RIL_setRilSocketName(char * s);
 
 
 static struct RIL_Env s_rilEnv = {
@@ -101,26 +106,48 @@ int main(int argc, char **argv)
 {
     const char * rilLibPath = NULL;
     char **rilArgv;
+    static char * s_argv[MAX_LIB_ARGS] = {NULL};
     void *dlHandle;
     const RIL_RadioFunctions *(*rilInit)(const struct RIL_Env *, int, char **);
     const RIL_RadioFunctions *funcs;
     char libPath[PROPERTY_VALUE_MAX];
     unsigned char hasLibArgs = 0;
-
+    int j = 0;
     int i;
+    static char clientId[3] = {'0'};
+
+    RLOGD("**RIL Daemon Started**");
+    RLOGD("**RILd param count=%d**", argc);
+    memset(s_argv, 0, sizeof(s_argv));
+
+    s_argv[0] = argv[0];
 
     umask(S_IRGRP | S_IWGRP | S_IXGRP | S_IROTH | S_IWOTH | S_IXOTH);
-    for (i = 1; i < argc ;) {
+    for (i = 1, j = 1; i < argc ;) {
         if (0 == strcmp(argv[i], "-l") && (argc - i > 1)) {
             rilLibPath = argv[i + 1];
+            i += 2;
+        } else if (0 == strcmp(argv[i], "-c") && (argc - i > 1)) {
+            strncpy(clientId, argv[i+1], strlen(clientId));
             i += 2;
         } else if (0 == strcmp(argv[i], "--")) {
             i++;
             hasLibArgs = 1;
+            memcpy(&s_argv[j], &argv[i], argc-i);
             break;
         } else {
             usage(argv[0]);
         }
+    }
+
+    if (atoi(clientId) >= MAX_RILDS) {
+        RLOGE("Max Number of rild's supported is: %d", MAX_RILDS);
+        exit(0);
+    }
+    RLOGD ("RIL Client Id:=%s", clientId);
+
+    if (strncmp(clientId, "0", MAX_CLIENT_ID_LENGTH)) {
+        RIL_setRilSocketName(clientId);
     }
 
     if (rilLibPath == NULL) {
@@ -136,7 +163,6 @@ int main(int argc, char **argv)
     /* special override when in the emulator */
 #if 1
     {
-        static char*  arg_overrides[3];
         static char   arg_device[32];
         int           done = 0;
 
@@ -148,7 +174,7 @@ int main(int argc, char **argv)
         int           fd = open("/proc/cmdline",O_RDONLY);
 
         if (fd < 0) {
-            ALOGD("could not open /proc/cmdline:%s", strerror(errno));
+            RLOGD("could not open /proc/cmdline:%s", strerror(errno));
             goto OpenLib;
         }
 
@@ -157,7 +183,7 @@ int main(int argc, char **argv)
         while (len == -1 && errno == EINTR);
 
         if (len < 0) {
-            ALOGD("could not read /proc/cmdline:%s", strerror(errno));
+            RLOGD("could not read /proc/cmdline:%s", strerror(errno));
             close(fd);
             goto OpenLib;
         }
@@ -188,18 +214,19 @@ int main(int argc, char **argv)
                     snprintf( arg_device, sizeof(arg_device), "%s/%s",
                                 ANDROID_SOCKET_DIR, QEMUD_SOCKET_NAME );
 
-                    arg_overrides[1] = "-s";
-                    arg_overrides[2] = arg_device;
+                    memset(s_argv, 0, sizeof(s_argv));
+                    s_argv[1] = "-s";
+                    s_argv[2] = arg_device;
                     done = 1;
                     break;
                 }
-                ALOGD("could not connect to %s socket: %s",
+                RLOGD("could not connect to %s socket: %s",
                     QEMUD_SOCKET_NAME, strerror(errno));
                 if (--tries == 0)
                     break;
             }
             if (!done) {
-                ALOGE("could not connect to %s socket (giving up): %s",
+                RLOGE("could not connect to %s socket (giving up): %s",
                     QEMUD_SOCKET_NAME, strerror(errno));
                 while(1)
                     sleep(0x00ffffff);
@@ -222,20 +249,19 @@ int main(int argc, char **argv)
 
             snprintf( arg_device, sizeof(arg_device), DEV_PREFIX "%s", p );
             arg_device[sizeof(arg_device)-1] = 0;
-            arg_overrides[1] = "-d";
-            arg_overrides[2] = arg_device;
+            memset(s_argv, 0, sizeof(s_argv));
+            s_argv[1] = "-d";
+            s_argv[2] = arg_device;
             done = 1;
 
         } while (0);
 
         if (done) {
-            argv = arg_overrides;
             argc = 3;
             i    = 1;
             hasLibArgs = 1;
             rilLibPath = REFERENCE_RIL_PATH;
-
-            ALOGD("overriding with %s %s", arg_overrides[1], arg_overrides[2]);
+            RLOGD("overriding with %s %s", s_argv[1], s_argv[2]);
         }
     }
 OpenLib:
@@ -245,7 +271,7 @@ OpenLib:
     dlHandle = dlopen(rilLibPath, RTLD_NOW);
 
     if (dlHandle == NULL) {
-        fprintf(stderr, "dlopen failed: %s\n", dlerror());
+        RLOGE("dlopen failed: %s", dlerror());
         exit(-1);
     }
 
@@ -254,25 +280,32 @@ OpenLib:
     rilInit = (const RIL_RadioFunctions *(*)(const struct RIL_Env *, int, char **))dlsym(dlHandle, "RIL_Init");
 
     if (rilInit == NULL) {
-        fprintf(stderr, "RIL_Init not defined or exported in %s\n", rilLibPath);
+        RLOGE("RIL_Init not defined or exported in %s\n", rilLibPath);
         exit(-1);
     }
 
     if (hasLibArgs) {
-        rilArgv = argv + i - 1;
-        argc = argc -i + 1;
+        argc = argc-i+1;
     } else {
         static char * newArgv[MAX_LIB_ARGS];
         static char args[PROPERTY_VALUE_MAX];
-        rilArgv = newArgv;
         property_get(LIB_ARGS_PROPERTY, args, "");
-        argc = make_argv(args, rilArgv);
+        argc = make_argv(args, s_argv);
     }
 
     // Make sure there's a reasonable argv[0]
-    rilArgv[0] = argv[0];
+    s_argv[0] = argv[0];
 
-    funcs = rilInit(&s_rilEnv, argc, rilArgv);
+    if (argc >= MAX_LIB_ARGS - 2) {
+        RLOGE("Max arguments are passed for rild, args count = %d", argc);
+        exit(0);
+    }
+    s_argv[argc++] = "-c";
+    s_argv[argc++] = clientId;
+
+    RLOGD("RIL_Init argc = %d clientId = %s", argc, s_argv[argc-1]);
+
+    funcs = rilInit(&s_rilEnv, argc, s_argv);
 
     RIL_register(funcs);
 
